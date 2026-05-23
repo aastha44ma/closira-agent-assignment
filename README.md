@@ -1,6 +1,4 @@
 # Closira Agent Assignment - Bloom Aesthetics Clinic
-
-**Status:** ✅ Ready to Test  
 **Project Type:** AI Agent for Customer Classification  
 **Client:** Bloom Aesthetics Clinic  
 
@@ -31,7 +29,8 @@ pip install openai pydantic instructor python-dotenv
 Create a `.env` file in the project root:
 
 ```
-OPENAI_API_KEY=your_api_key_here
+Gemini_API
+"To ensure optimal budget flexibility during the initial testing phase, I leveraged the OpenAI SDK's backwards compatibility to map our structured extraction engine directly to Google's Gemini Flash infrastructure via AI Studio. This shows how our agent framework can change underlying foundation model layers instantly with minimal disruption to the code base."
 ```
 
 ### 3. Run the Agent
@@ -188,63 +187,14 @@ lead_indicators = ["consultation", "book", "...]
 
 ---
 
-## 🎬 Video Walkthrough Checklist
-
-For your 2-5 minute presentation:
-
-- [ ] Show the project structure in VS Code Explorer
-- [ ] Display `sop.json` to show SOP rules
-- [ ] Open and read a test transcript
-- [ ] Run `python main.py test` to show all 5 test cases
-- [ ] Demonstrate interactive mode with a custom message
-- [ ] Show the Markdown Preview of `prompt_design.md`
-- [ ] Explain classification logic and decision-making
-- [ ] Mention the Pydantic schema benefits
 
 ---
 
 ## 📦 Dependencies
 
-- **openai** — OpenAI API client (future enhancement)
 - **pydantic** — Data validation with Python type hints
 - **instructor** — Structured outputs (future enhancement)
 - **python-dotenv** — Environment variable management
 
 ---
-
-## 🔐 Security Notes
-
-⚠️ **NEVER commit `.env` file to GitHub!**
-
-The `.gitignore` is configured to exclude:
-- `.env` (API keys)
-- `__pycache__/` (compiled files)
-- `.venv/` (virtual environment)
-
----
-
-## 📞 Support & Next Steps
-
-1. **Verify Setup:** Run `python main.py test` to confirm everything works
-2. **Test Edge Cases:** Use interactive mode to test scenarios
-3. **Review Docs:** Check `prompt_design.md` for system design explanation
-4. **Record Demo:** Capture your 2-5 minute walkthrough showing all features
-
----
-
-## ✨ Features Highlight
-
-✅ Pydantic schema for type-safe outputs  
-✅ Rule-based classification system  
-✅ Escalation detection with severity levels  
-✅ Lead qualification scoring  
-✅ Conversation summarization  
-✅ Confidence-based filtering  
-✅ Extensible SOP configuration  
-✅ Interactive testing mode  
-
----
-
-**Ready to test?** Run: `python main.py test`
-
-Good luck with your assignment! 🎉
+Happy To contribute!!
