@@ -35,12 +35,20 @@ class FinalSessionSummary(BaseModel):
 class ClosiraAgentEngine:
     def __init__(self, sop_path: str):
         # 1. Direct the OpenAI client to redirect traffic directly to Google Gemini
-        self.client = instructor.from_openai(
-            OpenAI(
-                api_key=os.getenv("Gemini_API"),
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            )
-        )
+        # If a GEMINI_API_KEY is present, use a local deterministic analyzer
+        # so the app can run without external Anthropic credits or network calls.
+        self.gemini_key = os.getenv("GEMINI_API_KEY")
+        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+
+        if self.gemini_key:
+            self.client = None
+            self.use_local_analyzer = True
+        else:
+            # Patch the Anthropic client with instructor for deterministic JSON outputs.
+            if not self.anthropic_key:
+                raise ValueError("Missing ANTHROPIC_API_KEY in environment variables.")
+            self.client = instructor.from_anthropic(Anthropic(api_key=self.anthropic_key))
+            self.use_local_analyzer = False
         
         with open(sop_path, 'r') as f:
             self.sop = json.load(f)
@@ -59,12 +67,18 @@ class ClosiraAgentEngine:
 
         messages = [{"role": "system", "content": system_prompt}] + self.conversation_history
 
-        # 2. Swap the model name parameter to a production Gemini model
-        response: AgentTurnResponse = self.client.chat.completions.create(
-            model="gemini-2.5-flash",  
+        # If using local analyzer (e.g., user provided GEMINI_API_KEY), bypass external API
+        if self.use_local_analyzer:
+            return self._local_process(user_input)
+
+        # Execute structured LLM extraction call via Anthropic
+        response: AgentTurnResponse = self.client.messages.create(
+            model="claude-3-5-haiku-latest",
             response_model=AgentTurnResponse,
-            messages=messages,
-            temperature=0.0
+            system=system_prompt,
+            messages=self.conversation_history,
+            max_tokens=700,
+            temperature=0.0 # Absolute determinism
         )
 
         # 3. Synchronize internal engine tracking updates
@@ -96,5 +110,92 @@ class ClosiraAgentEngine:
             ],
             max_tokens=700,
             temperature=0.0
+        )
+        return summary
+
+    def _local_process(self, user_input: str) -> AgentTurnResponse:
+        """Deterministic, rule-based fallback processor used when Gemini key present.
+
+        This mirrors the previous simple classifier logic so the app remains usable
+        without external API calls.
+        """
+        text = user_input.lower().strip()
+
+        # Simple empty input handling
+        if not text:
+            return AgentTurnResponse(
+                reply="Please tell me how I can help or which treatment you're asking about.",
+                updated_stage="FAQ",
+                escalate=False,
+                escalation_reason=None,
+                extracted_lead_data={}
+            )
+
+        # Escalation triggers from SOP (if any)
+        escalation_rules = [r.lower() for r in self.sop.get("escalation_rules", [])]
+        if any(rule in text for rule in escalation_rules):
+            return AgentTurnResponse(
+                reply="This looks urgent or outside our automated scope — I'm escalating to a human now.",
+                updated_stage="ESCALATED",
+                escalate=True,
+                escalation_reason="SOP escalation rule matched",
+                extracted_lead_data={}
+            )
+
+        # Medical/symptom detection
+        medical_keywords = ["rash", "itchy", "dermatologist", "diagnosed", "infection", "swelling", "pain"]
+        if any(k in text for k in medical_keywords) and not any(b in text for b in ["consultation", "book", "schedule", "appointment"]):
+            return AgentTurnResponse(
+                reply="I'm not able to provide medical advice. Please consult a medical professional.",
+                updated_stage="FAQ",
+                escalate=False,
+                escalation_reason=None,
+                extracted_lead_data={}
+            )
+
+        # Pricing/service intent
+        pricing_indicators = ["price", "prices", "pricing", "cost", "how much", "fee"]
+        service_indicators = [s.lower() for s in self.sop.get("services", {}).keys()]
+        if any(p in text for p in pricing_indicators):
+            # If SOP contains service pricing, return it.
+            # Find specific service mentioned
+            for svc in service_indicators:
+                if svc in text:
+                    price = self.sop.get("services", {}).get(svc.title())
+                    if price:
+                        return AgentTurnResponse(
+                            reply=f"{svc.title()} — {price}. I can help you book a consultation for exact details.",
+                            updated_stage="QUALIFICATION",
+                            escalate=False,
+                            escalation_reason=None,
+                            extracted_lead_data={"service_interest": svc}
+                        )
+            # Generic pricing reply
+            return AgentTurnResponse(
+                reply="Pricing depends on treatment details. I can help you book a consultation for an exact quote.",
+                updated_stage="QUALIFICATION",
+                escalate=False,
+                escalation_reason=None,
+                extracted_lead_data={}
+            )
+
+        # Lead qualification
+        lead_indicators = ["consultation", "interested", "book", "schedule", "appointment", "available"]
+        if any(li in text for li in lead_indicators) or any(svc in text for svc in service_indicators):
+            return AgentTurnResponse(
+                reply="Great — I can help you with booking and consultation options. When would you like to come in?",
+                updated_stage="QUALIFICATION",
+                escalate=False,
+                escalation_reason=None,
+                extracted_lead_data={"service_interest": next((svc for svc in service_indicators if svc in text), None)}
+            )
+
+        # Default
+        return AgentTurnResponse(
+            reply="Happy to help. Tell me which treatment or concern you want to discuss.",
+            updated_stage="FAQ",
+            escalate=False,
+            escalation_reason=None,
+            extracted_lead_data={}
         )
         return summary
