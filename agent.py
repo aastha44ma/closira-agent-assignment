@@ -35,9 +35,22 @@ class FinalSessionSummary(BaseModel):
 class ClosiraAgentEngine:
     def __init__(self, sop_path: str):
         # 1. Direct the OpenAI client to redirect traffic directly to Google Gemini
-        # If a GEMINI_API_KEY is present, use a local deterministic analyzer
+        # If a GEMINI key is present (accept several common env names), use a local deterministic analyzer
         # so the app can run without external Anthropic credits or network calls.
-        self.gemini_key = os.getenv("GEMINI_API_KEY")
+        possible_gemini_keys = [
+            "GEMINI_API_KEY",
+            "GEMINI_API",
+            "Gemini_API_KEY",
+            "Gemini_API",
+            "Gemini_APi",
+            "Gemini_APi_key",
+        ]
+        self.gemini_key = None
+        for kname in possible_gemini_keys:
+            val = os.getenv(kname)
+            if val:
+                self.gemini_key = val
+                break
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY")
 
         if self.gemini_key:
@@ -56,30 +69,47 @@ class ClosiraAgentEngine:
         self.conversation_history = []
         self.current_stage = "FAQ"
         self.compiled_lead_data = {}
+        self.last_reply = ""
 
     def process_message(self, user_input: str) -> AgentTurnResponse:
         self.conversation_history.append({"role": "user", "content": user_input})
         
         system_prompt = f"""
         You are an elite, highly precise AI Assistant for {self.sop['business_name']}.
-        ... [Keep your exact system prompt text from the previous step here] ...
+
+        CLINIC KNOWLEDGEBASE (SOP):
+        - Operating Hours: {self.sop['hours']}
+        - Services & Rates: {json.dumps(self.sop['services'])}
+        - Booking Policy: {self.sop['booking_policy']}
+        - Qualification Checkpoints to ask/verify: {json.dumps(self.sop['qualification_questions'])}
+        - Hard Escalation Rules: {json.dumps(self.sop['escalation_rules'])}
+
+        STATE CONTROLLER CONTEXT:
+        - Current Active Stage: {self.current_stage}
+        - Current Gathered Lead Metrics: {json.dumps(self.compiled_lead_data)}
+
+        STRICT SAFETY MANDATES:
+        1. Rely ONLY on the provided Clinic Knowledgebase. If a user asks about a service, price, or policy NOT explicitly listed in the SOP, you MUST set 'escalate' to true and note the gap. Do not hallucinate.
+        2. Sentiment Check: If the user displays frustration, anger, or opens a complaint, escalate immediately.
+        3. PROGRESSION MANDATE: Once you have answered the user's initial questions, you MUST transition 'updated_stage' to 'QUALIFICATION' in your response and immediately ask the first checkpoint question: "What specific treatment or area are you looking to target?"
+        4. VARIATION RULE: Do not repeat your previous replies. Tailor your response dynamically to the user's latest statement.
         """
 
         messages = [{"role": "system", "content": system_prompt}] + self.conversation_history
 
         # If using local analyzer (e.g., user provided GEMINI_API_KEY), bypass external API
         if self.use_local_analyzer:
-            return self._local_process(user_input)
-
-        # Execute structured LLM extraction call via Anthropic
-        response: AgentTurnResponse = self.client.messages.create(
-            model="claude-3-5-haiku-latest",
-            response_model=AgentTurnResponse,
-            system=system_prompt,
-            messages=self.conversation_history,
-            max_tokens=700,
-            temperature=0.0 # Absolute determinism
-        )
+            response = self._local_process(user_input)
+        else:
+            # Execute structured LLM extraction call via Anthropic
+            response = self.client.messages.create(
+                model="claude-3-5-haiku-latest",
+                response_model=AgentTurnResponse,
+                system=system_prompt,
+                messages=self.conversation_history,
+                max_tokens=700,
+                temperature=0.0 # Absolute determinism
+            )
 
         # 3. Synchronize internal engine tracking updates
         self.conversation_history.append({"role": "assistant", "content": response.reply})
@@ -123,22 +153,33 @@ class ClosiraAgentEngine:
 
         # Simple empty input handling
         if not text:
-            return AgentTurnResponse(
-                reply="Please tell me how I can help or which treatment you're asking about.",
-                updated_stage="FAQ",
-                escalate=False,
-                escalation_reason=None,
-                extracted_lead_data={}
-            )
+            reply = "Please tell me how I can help or which treatment you're asking about."
+            if reply == self.last_reply:
+                reply = "Could you share a treatment or question so I can assist?"
+            self.last_reply = reply
+            return AgentTurnResponse(reply=reply, updated_stage="FAQ", escalate=False, escalation_reason=None, extracted_lead_data={})
 
         # Escalation triggers from SOP (if any)
         escalation_rules = [r.lower() for r in self.sop.get("escalation_rules", [])]
         if any(rule in text for rule in escalation_rules):
+            self.last_reply = "This looks urgent or outside our automated scope — I'm escalating to a human now."
             return AgentTurnResponse(
-                reply="This looks urgent or outside our automated scope — I'm escalating to a human now.",
+                reply=self.last_reply,
                 updated_stage="ESCALATED",
                 escalate=True,
                 escalation_reason="SOP escalation rule matched",
+                extracted_lead_data={}
+            )
+
+        # Sentiment check: escalate on complaints, anger, or frustration
+        sentiment_indicators = ["angry", "frustrated", "upset", "not happy", "complaint", "complain", "mad", "furious"]
+        if any(si in text for si in sentiment_indicators):
+            self.last_reply = "I can see you're upset. I'm escalating this to a human operator for immediate assistance."
+            return AgentTurnResponse(
+                reply=self.last_reply,
+                updated_stage="ESCALATED",
+                escalate=True,
+                escalation_reason="Sentiment escalation detected",
                 extracted_lead_data={}
             )
 
@@ -148,6 +189,22 @@ class ClosiraAgentEngine:
             return AgentTurnResponse(
                 reply="I'm not able to provide medical advice. Please consult a medical professional.",
                 updated_stage="FAQ",
+                escalate=False,
+                escalation_reason=None,
+                extracted_lead_data={}
+            )
+
+        # Opening hours / availability queries
+        hours_indicators = ["opening hours", "opening hour", "hours", "open", "when are you open", "time are you open", "availability"]
+        if any(h in text for h in hours_indicators):
+            hours_text = self.sop.get("hours", "Monday to Saturday, 9:00 AM - 7:00 PM. Closed on Sundays.")
+            reply = f"Our opening hours are {hours_text}\n\nWhat specific treatment or area are you looking to target?"
+            if reply == self.last_reply:
+                reply = f"We're open {hours_text}\n\nCould you share the treatment area you're interested in?"
+            self.last_reply = reply
+            return AgentTurnResponse(
+                reply=reply,
+                updated_stage="QUALIFICATION",
                 escalate=False,
                 escalation_reason=None,
                 extracted_lead_data={}
@@ -163,39 +220,76 @@ class ClosiraAgentEngine:
                 if svc in text:
                     price = self.sop.get("services", {}).get(svc.title())
                     if price:
-                        return AgentTurnResponse(
-                            reply=f"{svc.title()} — {price}. I can help you book a consultation for exact details.",
-                            updated_stage="QUALIFICATION",
-                            escalate=False,
-                            escalation_reason=None,
-                            extracted_lead_data={"service_interest": svc}
-                        )
+                        normalized_price = price.replace("Â£", "GBP ").replace("£", "GBP ").replace("Â", "")
+                        reply = f"{svc.title()} — {normalized_price}. I can help you book a consultation for exact details.\n\nWhat specific treatment or area are you looking to target?"
+                        if reply == self.last_reply:
+                            reply = f"{svc.title()} — {normalized_price}. I can help you book a consultation for exact details.\n\nCould you tell me which area you'd like treated?"
+                        self.last_reply = reply
+                        return AgentTurnResponse(reply=reply, updated_stage="QUALIFICATION", escalate=False, escalation_reason=None, extracted_lead_data={"service_interest": svc})
             # Generic pricing reply
+            reply = "Pricing depends on treatment details. I can help you book a consultation for an exact quote.\n\nWhat specific treatment or area are you looking to target?"
+            if reply == self.last_reply:
+                reply = "Pricing depends on treatment details. I can help you book a consultation for an exact quote.\n\nCould you share the area or treatment you're interested in?"
+            self.last_reply = reply
+            return AgentTurnResponse(reply=reply, updated_stage="QUALIFICATION", escalate=False, escalation_reason=None, extracted_lead_data={})
+
+        # If a user asks about a service that isn't in the SOP, escalate per mandate #1
+        if any(token in text for token in ["service", "treatment", "procedure", "price", "pricing", "cost", "fee"]) and not any(svc in text for svc in service_indicators):
+            self.last_reply = "I'm sorry — that service or pricing information isn't listed in our clinic knowledgebase. I'm escalating this to a human for an exact answer."
             return AgentTurnResponse(
-                reply="Pricing depends on treatment details. I can help you book a consultation for an exact quote.",
-                updated_stage="QUALIFICATION",
-                escalate=False,
-                escalation_reason=None,
+                reply=self.last_reply,
+                updated_stage="ESCALATED",
+                escalate=True,
+                escalation_reason="Service/pricing not in SOP",
                 extracted_lead_data={}
             )
+
+        # Stage-aware follow-up handling so the conversation can continue after the first answer.
+        if self.current_stage == "QUALIFICATION":
+            followup_time_indicators = [
+                "today",
+                "tomorrow",
+                "this week",
+                "next week",
+                "morning",
+                "afternoon",
+                "evening",
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+            ]
+            if any(item in text for item in followup_time_indicators):
+                reply = (
+                    f"Great, I've noted {text}. "
+                    "Have you ever had clinical aesthetic treatments before?"
+                )
+                if reply == self.last_reply:
+                    reply = "Got it. Have you ever had clinical aesthetic treatments before?"
+                self.last_reply = reply
+                self.compiled_lead_data["preferred_time"] = text
+                return AgentTurnResponse(
+                    reply=reply,
+                    updated_stage="QUALIFICATION",
+                    escalate=False,
+                    escalation_reason=None,
+                    extracted_lead_data={"preferred_time": text}
+                )
 
         # Lead qualification
         lead_indicators = ["consultation", "interested", "book", "schedule", "appointment", "available"]
         if any(li in text for li in lead_indicators) or any(svc in text for svc in service_indicators):
-            return AgentTurnResponse(
-                reply="Great — I can help you with booking and consultation options. When would you like to come in?",
-                updated_stage="QUALIFICATION",
-                escalate=False,
-                escalation_reason=None,
-                extracted_lead_data={"service_interest": next((svc for svc in service_indicators if svc in text), None)}
-            )
+            reply = "Great — I can help you with booking and consultation options. When would you like to come in?\n\nWhat specific treatment or area are you looking to target?"
+            if reply == self.last_reply:
+                reply = "Great — I can help you with booking and consultation options.\n\nCould you share the treatment area you're interested in?"
+            self.last_reply = reply
+            return AgentTurnResponse(reply=reply, updated_stage="QUALIFICATION", escalate=False, escalation_reason=None, extracted_lead_data={"service_interest": next((svc for svc in service_indicators if svc in text), None)})
 
         # Default
-        return AgentTurnResponse(
-            reply="Happy to help. Tell me which treatment or concern you want to discuss.",
-            updated_stage="FAQ",
-            escalate=False,
-            escalation_reason=None,
-            extracted_lead_data={}
-        )
-        return summary
+        reply = "Happy to help. Tell me which treatment or concern you want to discuss."
+        if reply == self.last_reply:
+            reply = "Could you please tell me which treatment or concern you want to discuss?"
+        self.last_reply = reply
+        return AgentTurnResponse(reply=reply, updated_stage="FAQ", escalate=False, escalation_reason=None, extracted_lead_data={})
